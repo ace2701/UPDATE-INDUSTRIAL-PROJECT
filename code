@@ -1,0 +1,815 @@
+//+------------------------------------------------------------------+
+//|                                                EA-15_ADX.mq5     |
+//|                       EA-15 — ADX Trend Strength                 |
+//+------------------------------------------------------------------+
+#property strict
+#property version   "1.00"
+#property description "EA-15 - ADX Trend Strength"
+#property description "Native MQL5 ADX DI crossover strategy."
+
+#include <Trade/Trade.mqh>
+
+CTrade trade;
+
+//--- General
+input long   MagicNumber            = 9015;  // Unique magic number
+input double LotSize                = 0.10;  // Fixed lot size
+input int    MaxSpreadPoints        = 50;    // Maximum allowed spread
+
+//--- ADX
+input int    ADXPeriod               = 14;   // ADX calculation period
+input double MinimumADX              = 20.0; // Minimum ADX trend strength
+
+//--- Optional ADX rising filter
+input bool   UseADXRisingFilter      = false; // Require ADX to be rising
+
+//--- Optional DI strength filter
+input bool   UseDIStrengthFilter     = false; // Require minimum DI separation
+input double MinimumDIDifference      = 0.0;  // Minimum DI difference
+
+//--- Risk management
+input double StopLossPercent         = 0.50; // Fixed percentage stop loss
+input double RiskRewardRatio         = 1.50; // Take profit risk/reward ratio
+
+//--- Optional exits
+input bool   UseADXWeaknessExit      = false; // Exit when ADX becomes weak
+input double ADXWeaknessLevel        = 15.0;  // ADX weakness threshold
+input bool   UseOppositeDIExit       = false; // Exit on opposite DI dominance
+
+//--- Trading hours
+input bool   UseTradingHours         = false; // Enable trading hours filter
+input int    StartHour               = 0;     // Trading start hour
+input int    EndHour                 = 23;    // Trading end hour
+
+//--- Global indicator handle
+int adxHandle = INVALID_HANDLE;
+
+//--- New-bar tracking
+datetime lastBarTime = 0;
+
+//+------------------------------------------------------------------+
+//| Expert initialization                                            |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   //--- Validate parameters
+   if(ADXPeriod <= 0)
+      return INIT_PARAMETERS_INCORRECT;
+
+   if(MinimumADX <= 0.0)
+      return INIT_PARAMETERS_INCORRECT;
+
+   if(StopLossPercent <= 0.0)
+      return INIT_PARAMETERS_INCORRECT;
+
+   if(RiskRewardRatio <= 0.0)
+      return INIT_PARAMETERS_INCORRECT;
+
+   if(LotSize <= 0.0)
+      return INIT_PARAMETERS_INCORRECT;
+
+   if(MaxSpreadPoints < 0)
+      return INIT_PARAMETERS_INCORRECT;
+
+   if(StartHour < 0 || StartHour > 23)
+      return INIT_PARAMETERS_INCORRECT;
+
+   if(EndHour < 0 || EndHour > 23)
+      return INIT_PARAMETERS_INCORRECT;
+
+   if(MinimumDIDifference < 0.0)
+      return INIT_PARAMETERS_INCORRECT;
+
+   if(ADXWeaknessLevel < 0.0)
+      return INIT_PARAMETERS_INCORRECT;
+
+   //--- Create native MQL5 ADX handle
+   adxHandle = iADX(_Symbol, PERIOD_CURRENT, ADXPeriod);
+
+   if(adxHandle == INVALID_HANDLE)
+   {
+      Print("EA-15: Failed to create ADX indicator handle. Error: ",
+            GetLastError());
+      return INIT_FAILED;
+   }
+
+   //--- Configure trade object
+   trade.SetExpertMagicNumber((ulong)MagicNumber);
+   trade.SetTypeFillingBySymbol(_Symbol);
+   trade.SetAsyncMode(false);
+
+   //--- Initialize new-bar reference without generating a signal
+   lastBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+
+   return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization                                          |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   if(adxHandle != INVALID_HANDLE)
+   {
+      IndicatorRelease(adxHandle);
+      adxHandle = INVALID_HANDLE;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   //--- Trading decisions are made only once per newly opened candle
+   if(!IsNewBar())
+      return;
+
+   //--- Manage existing EA position first
+   ManagePositions();
+
+   //--- Only one position per symbol + magic number
+   if(HasOpenPosition())
+      return;
+
+   //--- Spread protection
+   if(!IsSpreadAcceptable())
+      return;
+
+   //--- Trading hours protection
+   if(!IsTradingTime())
+      return;
+
+   //--- Retrieve ADX and DI values from completed candles
+   double adx1 = 0.0;
+   double adx2 = 0.0;
+   double plusDI1 = 0.0;
+   double plusDI2 = 0.0;
+   double minusDI1 = 0.0;
+   double minusDI2 = 0.0;
+
+   if(!GetADXValues(adx1,
+                   adx2,
+                   plusDI1,
+                   plusDI2,
+                   minusDI1,
+                   minusDI2))
+   {
+      return;
+   }
+
+   //--- Check bullish crossover
+   if(IsBullishDICrossover(plusDI1,
+                           plusDI2,
+                           minusDI1,
+                           minusDI2))
+   {
+      if(PassesADXFilter(adx1))
+      {
+         if(PassesADXRisingFilter(adx1, adx2))
+         {
+            if(PassesDIStrengthFilter(plusDI1, minusDI1))
+            {
+               OpenBuy();
+               return;
+            }
+         }
+      }
+   }
+
+   //--- Check bearish crossover
+   if(IsBearishDICrossover(plusDI1,
+                           plusDI2,
+                           minusDI1,
+                           minusDI2))
+   {
+      if(PassesADXFilter(adx1))
+      {
+         if(PassesADXRisingFilter(adx1, adx2))
+         {
+            if(PassesDIStrengthFilter(plusDI1, minusDI1))
+            {
+               OpenSell();
+               return;
+            }
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Detect a newly opened candle                                     |
+//+------------------------------------------------------------------+
+bool IsNewBar()
+{
+   datetime currentBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+
+   if(currentBarTime <= 0)
+      return false;
+
+   if(currentBarTime != lastBarTime)
+   {
+      lastBarTime = currentBarTime;
+      return true;
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Retrieve ADX values                                              |
+//| Buffer 0 = ADX                                                   |
+//| Buffer 1 = +DI                                                   |
+//| Buffer 2 = -DI                                                   |
+//+------------------------------------------------------------------+
+bool GetADXValues(double &adx1,
+                  double &adx2,
+                  double &plusDI1,
+                  double &plusDI2,
+                  double &minusDI1,
+                  double &minusDI2)
+{
+   if(adxHandle == INVALID_HANDLE)
+      return false;
+
+   //--- Make sure sufficient indicator data exists
+   int calculated = BarsCalculated(adxHandle);
+
+   if(calculated < ADXPeriod + 3)
+      return false;
+
+   double adxBuffer[2];
+   double plusDIBuffer[2];
+   double minusDIBuffer[2];
+
+   ArraySetAsSeries(adxBuffer, true);
+   ArraySetAsSeries(plusDIBuffer, true);
+   ArraySetAsSeries(minusDIBuffer, true);
+
+   //--- Retrieve completed candles only:
+   //--- index 0 of these arrays = chart bar 1
+   //--- index 1 of these arrays = chart bar 2
+   int copiedADX = CopyBuffer(adxHandle, 0, 1, 2, adxBuffer);
+   int copiedPlusDI = CopyBuffer(adxHandle, 1, 1, 2, plusDIBuffer);
+   int copiedMinusDI = CopyBuffer(adxHandle, 2, 1, 2, minusDIBuffer);
+
+   if(copiedADX != 2 ||
+      copiedPlusDI != 2 ||
+      copiedMinusDI != 2)
+   {
+      return false;
+   }
+
+   adx1 = adxBuffer[0];
+   adx2 = adxBuffer[1];
+
+   plusDI1 = plusDIBuffer[0];
+   plusDI2 = plusDIBuffer[1];
+
+   minusDI1 = minusDIBuffer[0];
+   minusDI2 = minusDIBuffer[1];
+
+   //--- Reject invalid indicator values
+   if(!MathIsValidNumber(adx1) ||
+      !MathIsValidNumber(adx2) ||
+      !MathIsValidNumber(plusDI1) ||
+      !MathIsValidNumber(plusDI2) ||
+      !MathIsValidNumber(minusDI1) ||
+      !MathIsValidNumber(minusDI2))
+   {
+      return false;
+   }
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Check bullish DI crossover                                       |
+//+------------------------------------------------------------------+
+bool IsBullishDICrossover(const double plusDI1,
+                          const double plusDI2,
+                          const double minusDI1,
+                          const double minusDI2)
+{
+   //--- Bar 1: +DI dominates -DI
+   //--- Bar 2: +DI was not above -DI
+   return (plusDI1 > minusDI1 &&
+           plusDI2 <= minusDI2);
+}
+
+//+------------------------------------------------------------------+
+//| Check bearish DI crossover                                       |
+//+------------------------------------------------------------------+
+bool IsBearishDICrossover(const double plusDI1,
+                          const double plusDI2,
+                          const double minusDI1,
+                          const double minusDI2)
+{
+   //--- Bar 1: -DI dominates +DI
+   //--- Bar 2: -DI was not above +DI
+   return (minusDI1 > plusDI1 &&
+           minusDI2 <= plusDI2);
+}
+
+//+------------------------------------------------------------------+
+//| Minimum ADX filter                                               |
+//+------------------------------------------------------------------+
+bool PassesADXFilter(const double adxValue)
+{
+   return (adxValue >= MinimumADX);
+}
+
+//+------------------------------------------------------------------+
+//| Optional ADX rising filter                                      |
+//+------------------------------------------------------------------+
+bool PassesADXRisingFilter(const double adx1,
+                           const double adx2)
+{
+   if(!UseADXRisingFilter)
+      return true;
+
+   return (adx1 > adx2);
+}
+
+//+------------------------------------------------------------------+
+//| Optional DI strength filter                                     |
+//+------------------------------------------------------------------+
+bool PassesDIStrengthFilter(const double plusDI,
+                            const double minusDI)
+{
+   if(!UseDIStrengthFilter)
+      return true;
+
+   //--- For both directions, use absolute directional separation
+   double difference = MathAbs(plusDI - minusDI);
+
+   return (difference >= MinimumDIDifference);
+}
+
+//+------------------------------------------------------------------+
+//| Check whether this EA already has an open position              |
+//+------------------------------------------------------------------+
+bool HasOpenPosition()
+{
+   int totalPositions = PositionsTotal();
+
+   for(int i = totalPositions - 1; i >= 0; i--)
+   {
+      string symbol = PositionGetSymbol(i);
+
+      if(symbol == "")
+         continue;
+
+      long positionMagic = PositionGetInteger(POSITION_MAGIC);
+
+      if(symbol == _Symbol &&
+         positionMagic == MagicNumber)
+      {
+         return true;
+      }
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Spread filter                                                    |
+//+------------------------------------------------------------------+
+bool IsSpreadAcceptable()
+{
+   MqlTick tick;
+
+   if(!SymbolInfoTick(_Symbol, tick))
+      return false;
+
+   double spreadPoints = (tick.ask - tick.bid) / _Point;
+
+   return (spreadPoints <= (double)MaxSpreadPoints);
+}
+
+//+------------------------------------------------------------------+
+//| Trading hours filter                                             |
+//+------------------------------------------------------------------+
+bool IsTradingTime()
+{
+   if(!UseTradingHours)
+      return true;
+
+   MqlDateTime currentTime;
+
+   TimeToStruct(TimeCurrent(), currentTime);
+
+   int hour = currentTime.hour;
+
+   //--- Same start/end means the complete day
+   if(StartHour == EndHour)
+      return true;
+
+   //--- Normal session, e.g. 08 -> 17
+   if(StartHour < EndHour)
+   {
+      return (hour >= StartHour && hour < EndHour);
+   }
+
+   //--- Overnight session, e.g. 22 -> 06
+   return (hour >= StartHour || hour < EndHour);
+}
+
+//+------------------------------------------------------------------+
+//| Calculate broker-compatible lot size                             |
+//+------------------------------------------------------------------+
+double CalculateLotSize()
+{
+   double minimumVolume = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maximumVolume = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double volumeStep    = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+   if(minimumVolume <= 0.0 ||
+      maximumVolume <= 0.0 ||
+      volumeStep <= 0.0)
+   {
+      return 0.0;
+   }
+
+   double volume = LotSize;
+
+   //--- Respect broker limits
+   if(volume < minimumVolume)
+      volume = minimumVolume;
+
+   if(volume > maximumVolume)
+      volume = maximumVolume;
+
+   //--- Normalize downward to the broker's volume step
+   double steps = MathFloor((volume - minimumVolume) / volumeStep + 1.0e-9);
+
+   volume = minimumVolume + (steps * volumeStep);
+
+   if(volume < minimumVolume)
+      volume = minimumVolume;
+
+   if(volume > maximumVolume)
+      volume = maximumVolume;
+
+   //--- Determine suitable volume precision
+   int volumeDigits = GetVolumeDigits(volumeStep);
+
+   return NormalizeDouble(volume, volumeDigits);
+}
+
+//+------------------------------------------------------------------+
+//| Determine volume decimal places                                  |
+//+------------------------------------------------------------------+
+int GetVolumeDigits(const double step)
+{
+   if(step >= 1.0)
+      return 0;
+
+   if(step >= 0.1)
+      return 1;
+
+   if(step >= 0.01)
+      return 2;
+
+   if(step >= 0.001)
+      return 3;
+
+   return 4;
+}
+
+//+------------------------------------------------------------------+
+//| Normalize price according to symbol digits                      |
+//+------------------------------------------------------------------+
+double NormalizePrice(const double price)
+{
+   return NormalizeDouble(price, _Digits);
+}
+
+//+------------------------------------------------------------------+
+//| Calculate initial stop loss for BUY                              |
+//+------------------------------------------------------------------+
+double CalculateBuyStopLoss(const double entryPrice)
+{
+   double sl = entryPrice -
+               (entryPrice * StopLossPercent / 100.0);
+
+   double minimumDistance =
+      (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL)
+      * _Point;
+
+   //--- Guarantee broker minimum stop distance
+   if(minimumDistance > 0.0)
+   {
+      double requiredSL = entryPrice - minimumDistance;
+
+      if(sl > requiredSL)
+         sl = requiredSL;
+   }
+
+   return NormalizePrice(sl);
+}
+
+//+------------------------------------------------------------------+
+//| Calculate initial stop loss for SELL                             |
+//+------------------------------------------------------------------+
+double CalculateSellStopLoss(const double entryPrice)
+{
+   double sl = entryPrice +
+               (entryPrice * StopLossPercent / 100.0);
+
+   double minimumDistance =
+      (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL)
+      * _Point;
+
+   //--- Guarantee broker minimum stop distance
+   if(minimumDistance > 0.0)
+   {
+      double requiredSL = entryPrice + minimumDistance;
+
+      if(sl < requiredSL)
+         sl = requiredSL;
+   }
+
+   return NormalizePrice(sl);
+}
+
+//+------------------------------------------------------------------+
+//| Calculate take profit for BUY                                   |
+//+------------------------------------------------------------------+
+double CalculateBuyTakeProfit(const double entryPrice,
+                              const double stopLoss)
+{
+   double risk = entryPrice - stopLoss;
+
+   if(risk <= 0.0)
+      return 0.0;
+
+   double tp = entryPrice +
+               (risk * RiskRewardRatio);
+
+   double minimumDistance =
+      (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL)
+      * _Point;
+
+   //--- Guarantee broker minimum TP distance
+   if(minimumDistance > 0.0)
+   {
+      double requiredTP = entryPrice + minimumDistance;
+
+      if(tp < requiredTP)
+         tp = requiredTP;
+   }
+
+   return NormalizePrice(tp);
+}
+
+//+------------------------------------------------------------------+
+//| Calculate take profit for SELL                                  |
+//+------------------------------------------------------------------+
+double CalculateSellTakeProfit(const double entryPrice,
+                               const double stopLoss)
+{
+   double risk = stopLoss - entryPrice;
+
+   if(risk <= 0.0)
+      return 0.0;
+
+   double tp = entryPrice -
+               (risk * RiskRewardRatio);
+
+   double minimumDistance =
+      (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL)
+      * _Point;
+
+   //--- Guarantee broker minimum TP distance
+   if(minimumDistance > 0.0)
+   {
+      double requiredTP = entryPrice - minimumDistance;
+
+      if(tp > requiredTP)
+         tp = requiredTP;
+   }
+
+   return NormalizePrice(tp);
+}
+
+//+------------------------------------------------------------------+
+//| Open BUY position                                                |
+//+------------------------------------------------------------------+
+bool OpenBuy()
+{
+   MqlTick tick;
+
+   if(!SymbolInfoTick(_Symbol, tick))
+      return false;
+
+   double volume = CalculateLotSize();
+
+   if(volume <= 0.0)
+   {
+      Print("EA-15: Invalid calculated lot size.");
+      return false;
+   }
+
+   double entryPrice = NormalizePrice(tick.ask);
+
+   double stopLoss = CalculateBuyStopLoss(entryPrice);
+
+   if(stopLoss <= 0.0 || stopLoss >= entryPrice)
+   {
+      Print("EA-15: Invalid BUY Stop Loss.");
+      return false;
+   }
+
+   double takeProfit =
+      CalculateBuyTakeProfit(entryPrice, stopLoss);
+
+   if(takeProfit <= entryPrice)
+   {
+      Print("EA-15: Invalid BUY Take Profit.");
+      return false;
+   }
+
+   bool result = trade.Buy(volume,
+                           _Symbol,
+                           0.0,
+                           stopLoss,
+                           takeProfit,
+                           "EA-15 ADX BUY");
+
+   if(!result)
+   {
+      Print("EA-15: BUY order failed. Retcode=",
+            trade.ResultRetcode(),
+            " Description=",
+            trade.ResultRetcodeDescription());
+      return false;
+   }
+
+   Print("EA-15: BUY opened. Volume=",
+         DoubleToString(volume, 2),
+         " SL=",
+         DoubleToString(stopLoss, _Digits),
+         " TP=",
+         DoubleToString(takeProfit, _Digits));
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Open SELL position                                               |
+//+------------------------------------------------------------------+
+bool OpenSell()
+{
+   MqlTick tick;
+
+   if(!SymbolInfoTick(_Symbol, tick))
+      return false;
+
+   double volume = CalculateLotSize();
+
+   if(volume <= 0.0)
+   {
+      Print("EA-15: Invalid calculated lot size.");
+      return false;
+   }
+
+   double entryPrice = NormalizePrice(tick.bid);
+
+   double stopLoss = CalculateSellStopLoss(entryPrice);
+
+   if(stopLoss <= entryPrice)
+   {
+      Print("EA-15: Invalid SELL Stop Loss.");
+      return false;
+   }
+
+   double takeProfit =
+      CalculateSellTakeProfit(entryPrice, stopLoss);
+
+   if(takeProfit <= 0.0 || takeProfit >= entryPrice)
+   {
+      Print("EA-15: Invalid SELL Take Profit.");
+      return false;
+   }
+
+   bool result = trade.Sell(volume,
+                            _Symbol,
+                            0.0,
+                            stopLoss,
+                            takeProfit,
+                            "EA-15 ADX SELL");
+
+   if(!result)
+   {
+      Print("EA-15: SELL order failed. Retcode=",
+            trade.ResultRetcode(),
+            " Description=",
+            trade.ResultRetcodeDescription());
+      return false;
+   }
+
+   Print("EA-15: SELL opened. Volume=",
+         DoubleToString(volume, 2),
+         " SL=",
+         DoubleToString(stopLoss, _Digits),
+         " TP=",
+         DoubleToString(takeProfit, _Digits));
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Manage existing positions                                       |
+//+------------------------------------------------------------------+
+void ManagePositions()
+{
+   if(!UseADXWeaknessExit && !UseOppositeDIExit)
+      return;
+
+   double adx1 = 0.0;
+   double adx2 = 0.0;
+   double plusDI1 = 0.0;
+   double plusDI2 = 0.0;
+   double minusDI1 = 0.0;
+   double minusDI2 = 0.0;
+
+   if(!GetADXValues(adx1,
+                    adx2,
+                    plusDI1,
+                    plusDI2,
+                    minusDI1,
+                    minusDI2))
+   {
+      return;
+   }
+
+   int totalPositions = PositionsTotal();
+
+   for(int i = totalPositions - 1; i >= 0; i--)
+   {
+      string symbol = PositionGetSymbol(i);
+
+      if(symbol == "")
+         continue;
+
+      long positionMagic = PositionGetInteger(POSITION_MAGIC);
+
+      if(symbol != _Symbol ||
+         positionMagic != MagicNumber)
+      {
+         continue;
+      }
+
+      ulong ticket = (ulong)PositionGetInteger(POSITION_TICKET);
+
+      ENUM_POSITION_TYPE positionType =
+         (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+
+      bool closePosition = false;
+
+      //--- ADX weakness exit
+      if(UseADXWeaknessExit)
+      {
+         if(adx1 < ADXWeaknessLevel)
+            closePosition = true;
+      }
+
+      //--- Opposite DI exit
+      if(UseOppositeDIExit)
+      {
+         if(positionType == POSITION_TYPE_BUY)
+         {
+            if(minusDI1 > plusDI1)
+               closePosition = true;
+         }
+         else if(positionType == POSITION_TYPE_SELL)
+         {
+            if(plusDI1 > minusDI1)
+               closePosition = true;
+         }
+      }
+
+      if(closePosition)
+      {
+         bool result = trade.PositionClose(ticket);
+
+         if(!result)
+         {
+            Print("EA-15: Failed to close position #",
+                  ticket,
+                  ". Retcode=",
+                  trade.ResultRetcode(),
+                  " Description=",
+                  trade.ResultRetcodeDescription());
+         }
+         else
+         {
+            Print("EA-15: Position #",
+                  ticket,
+                  " closed by exit condition.");
+         }
+      }
+   }
+}
+//+------------------------------------------------------------------+
